@@ -1,0 +1,367 @@
+diff --git a/src/frameworks/foundation/ns_file_manager.rs b/src/frameworks/foundation/ns_file_manager.rs
+index badfe8d..63b49b0 100644
+--- a/src/frameworks/foundation/ns_file_manager.rs
++++ b/src/frameworks/foundation/ns_file_manager.rs
+@@ -28,6 +28,9 @@ const NSUserDomainMask: NSSearchPathDomainMask = 1;
+ pub const NSFileModificationDate: &str = "NSFileModificationDate";
+ pub const NSFileSize: &str = "NSFileSize";
+ const NSFileSystemFreeSize: &str = "NSFileSystemFreeSize";
++const NSFileSystemSize: &str = "NSFileSystemSize";
++const NSFileSystemNodes: &str = "NSFileSystemNodes";
++const NSFileSystemFreeNodes: &str = "NSFileSystemFreeNodes";
+ pub const NSFileType: &str = "NSFileType";
+ pub const NSFileTypeDirectory: &str = "NSFileTypeDirectory";
+ pub const NSFileTypeRegular: &str = "NSFileTypeRegular";
+@@ -42,6 +45,15 @@ pub const CONSTANTS: ConstantExports = &[
+         "_NSFileSystemFreeSize",
+         HostConstant::NSString(NSFileSystemFreeSize),
+     ),
++    ("_NSFileSystemSize", HostConstant::NSString(NSFileSystemSize)),
++    (
++        "_NSFileSystemNodes",
++        HostConstant::NSString(NSFileSystemNodes),
++    ),
++    (
++        "_NSFileSystemFreeNodes",
++        HostConstant::NSString(NSFileSystemFreeNodes),
++    ),
+     ("_NSFileType", HostConstant::NSString(NSFileType)),
+     (
+         "_NSFileTypeDirectory",
+@@ -411,7 +423,7 @@ pub const CLASSES: ClassExports = objc_classes! {
+ - (id)attributesOfFileSystemForPath:(id)_path
+                               error:(MutPtr<id>)error {
+     // TODO: other attributes
+-    log_once!("Warning: NSFileManager attributesOfFileSystemForPath:error: returns only NSFileSystemFreeSize attribute!");
++    log_once!("NSFileManager attributesOfFileSystemForPath: returning synthetic filesystem attributes.");
+ 
+     assert!(error.is_null()); // TODO
+ 
+@@ -420,12 +432,29 @@ pub const CLASSES: ClassExports = objc_classes! {
+     // Reporting 1 Gb of free space should be enough
+     // TODO: unify with `statfs`
+     // TODO: account for path
+-    let size: u64 = 1024 * 1024 * 1024;
++    let size: u64 = 16 * 1024 * 1024 * 1024;
+     let size_num: id = msg_class![env; NSNumber numberWithUnsignedLongLong:size];
+ 
+     let fs_free_size_key = get_static_str(env, NSFileSystemFreeSize);
+     () = msg![env; dict setObject:size_num forKey:fs_free_size_key];
+ 
++    // Some apps (including C&C Red Alert) also look at the total size and
++    // node counts, so provide plausible values for those too.
++    let total: u64 = 32 * 1024 * 1024 * 1024;
++    let total_num: id = msg_class![env; NSNumber numberWithUnsignedLongLong:total];
++    let fs_size_key = get_static_str(env, NSFileSystemSize);
++    () = msg![env; dict setObject:total_num forKey:fs_size_key];
++
++    let nodes: u64 = 1_000_000;
++    let nodes_num: id = msg_class![env; NSNumber numberWithUnsignedLongLong:nodes];
++    let fs_nodes_key = get_static_str(env, NSFileSystemNodes);
++    () = msg![env; dict setObject:nodes_num forKey:fs_nodes_key];
++
++    let free_nodes: u64 = 500_000;
++    let free_nodes_num: id = msg_class![env; NSNumber numberWithUnsignedLongLong:free_nodes];
++    let fs_free_nodes_key = get_static_str(env, NSFileSystemFreeNodes);
++    () = msg![env; dict setObject:free_nodes_num forKey:fs_free_nodes_key];
++
+     let dict_imm = msg![env; dict copy];
+     release(env, dict);
+     autorelease(env, dict_imm)
+@@ -486,3 +515,7 @@ fn file_attributes_common(env: &mut Environment, guest_path: &GuestPath) -> id {
+     release(env, dict);
+     autorelease(env, dict_imm)
+ }
++
++
++
++
+diff --git a/src/fs.rs b/src/fs.rs
+index f4f00d1..fb6fc0c 100644
+--- a/src/fs.rs
++++ b/src/fs.rs
+@@ -388,6 +388,12 @@ impl GuestFile {
+         GuestFile::File(file)
+     }
+ 
++    /// Open a host file and wrap it as a guest file. Used by the VFS fallback
++    /// shim in `libc::posix_io`.
++    pub fn from_host_path(path: &Path) -> std::io::Result<GuestFile> {
++        Ok(GuestFile::File(File::open(path)?))
++    }
++
+     fn from_ipa_file(file: &IpaFileRef) -> GuestFile {
+         GuestFile::IpaBundleFile(file.open())
+     }
+diff --git a/src/libc/posix_io.rs b/src/libc/posix_io.rs
+index d596b19..1494b90 100644
+--- a/src/libc/posix_io.rs
++++ b/src/libc/posix_io.rs
+@@ -21,7 +21,111 @@ use crate::mem::{
+     ConstPtr, ConstVoidPtr, GuestISize, GuestUSize, MutPtr, MutVoidPtr, Ptr, SafeRead,
+ };
+ use crate::Environment;
++use std::collections::HashMap;
+ use std::io::{Read, Seek, SeekFrom, Write};
++use std::sync::LazyLock;
++
++/// Locate the EA FUFS archive used to emulate the game VFS.
++fn vfs_archive_path() -> Option<&'static str> {
++    ["touchHLE_apps/Red Alert.app/data.vfs", "data.vfs"]
++        .into_iter()
++        .find(|p| std::path::Path::new(p).is_file())
++}
++
++/// Entry in the EA "FUFS" `data.vfs` archive (offset, size).
++struct VfsEntry {
++    offset: u64,
++    size: u32,
++}
++
++/// Lazily-parsed index of `./data.vfs`, keyed by the engine's filename hash.
++/// This is used to emulate the app's own VFS layer, which does not work
++/// correctly under touchHLE (it falls back to ordinary file I/O, which then
++/// fails because the app bundle contains no loose asset files).
++static VFS_INDEX: LazyLock<Option<HashMap<u32, VfsEntry>>> = LazyLock::new(|| {
++    let data = vfs_archive_path().and_then(|p| std::fs::read(p).ok())?;
++    if data.len() < 12 || &data[0..4] != b"FUFS" {
++        return None;
++    }
++    let count = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
++    let mut map = HashMap::with_capacity(count);
++    for i in 0..count {
++        let o = 12 + i * 12;
++        if o + 12 > data.len() {
++            break;
++        }
++        let offset = u32::from_le_bytes(data[o..o + 4].try_into().unwrap()) as u64;
++        let hash = u32::from_le_bytes(data[o + 4..o + 8].try_into().unwrap());
++        let size = u32::from_le_bytes(data[o + 8..o + 12].try_into().unwrap());
++        map.insert(hash, VfsEntry { offset, size });
++    }
++    Some(map)
++});
++
++/// The engine's filename hash: `h = h * 67 + c - 0x71`, after normalising
++/// backslashes to slashes and uppercasing ASCII letters.
++fn ea_vfs_hash(path: &str) -> u32 {
++    let mut h: u32 = 0;
++    for ch in path.chars() {
++        let mut c = ch as u32;
++        if c == 0x5c {
++            c = 0x2f;
++        }
++        if (0x61..=0x7a).contains(&c) {
++            c -= 0x20;
++        }
++        h = h.wrapping_mul(67).wrapping_add(c).wrapping_sub(0x71);
++    }
++    h
++}
++
++/// Turn a guest path into the key used by the app's VFS: paths inside the app
++/// bundle are relative to the bundle, everything else is relative to the root.
++fn vfs_key(path: &str) -> &str {
++    if let Some(idx) = path.find(".app/") {
++        return &path[idx + 5..];
++    }
++    path.trim_start_matches(['/', '\\'])
++}
++
++/// Try to satisfy an open from `data.vfs`. Returns a file descriptor on
++/// success. The entry is extracted into `vfs_cache/` on first use, so ordinary
++/// file semantics (seek, size) work.
++fn try_vfs_fallback(
++    env: &mut Environment,
++    path: &str,
++    flags: i32,
++) -> Option<FileDescriptor> {
++    if flags & O_ACCMODE != O_RDONLY {
++        return None;
++    }
++    let index = VFS_INDEX.as_ref()?;
++    let key = vfs_key(path);
++    let hash = ea_vfs_hash(key);
++    let entry = index.get(&hash)?;
++
++    let cache_dir = std::path::PathBuf::from("vfs_cache");
++    let _ = std::fs::create_dir_all(&cache_dir);
++    let cache_path = cache_dir.join(format!("{:08x}.bin", hash));
++    if !cache_path.exists() {
++        let mut src = std::fs::File::open(vfs_archive_path()?).ok()?;
++        src.seek(SeekFrom::Start(entry.offset)).ok()?;
++        let mut buf = vec![0u8; entry.size as usize];
++        src.read_exact(&mut buf).ok()?;
++        std::fs::write(&cache_path, &buf).ok()?;
++    }
++    let file = GuestFile::from_host_path(&cache_path).ok()?;
++    log!("VFS fallback: {:?} -> data.vfs entry (hash {:08x}, {} bytes)", path, hash, entry.size);
++    Some(find_or_create_fd(
++        env,
++        PosixFileHostObject {
++            file,
++            needs_flush: false,
++            reached_eof: false,
++            flags: 0,
++        },
++    ))
++}
+ 
+ #[derive(Default)]
+ pub struct State {
+@@ -216,7 +320,12 @@ pub fn open_direct(env: &mut Environment, path: ConstPtr<u8>, flags: i32) -> Fil
+             find_or_create_fd(env, host_object)
+         }
+         Err(error) => {
+-            log!("Warning: open({path:?}, {flags:#x}) failed with: {error:?}, returning -1");
++            if matches!(&error, FsError::DoesNotExist) {
++                if let Some(fd) = try_vfs_fallback(env, &path_string, flags) {
++                    return fd;
++                }
++            }
++            log!("Warning: open({path:?} = {path_string:?}, {flags:#x}) failed with: {error:?}, returning -1");
+             let errno = match error {
+                 FsError::AccessDenied => EACCES,
+                 FsError::AlreadyExist => EEXIST,
+@@ -1021,3 +1130,8 @@ fn validate_lock(env: &mut Environment, fd: FileDescriptor, lock: &flock) -> Res
+ 
+     Ok(())
+ }
++
++
++
++
++
+diff --git a/src/window.rs b/src/window.rs
+index d4eae99..fecd0b8 100644
+--- a/src/window.rs
++++ b/src/window.rs
+@@ -1,4 +1,4 @@
+-/*
++﻿/*
+  * This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+@@ -140,6 +140,20 @@ struct DpadState {
+     active: bool,
+ }
+ 
++/// State for a mouse-wheel-driven two-finger pinch gesture. The gesture is
++/// spread over several frames so that apps which require a held gesture can
++/// recognise it.
++struct PinchState {
++    id1: FingerId,
++    id2: FingerId,
++    cx: f32,
++    cy: f32,
++    dist: f32,
++    step: f32,
++    steps_left: u8,
++    last_update: Instant,
++}
++
+ #[derive(Debug)]
+ pub enum TextInputEvent {
+     Text(String),
+@@ -242,6 +256,7 @@ pub struct Window {
+     virtual_cursor_last: Option<(f32, f32, bool, bool)>,
+     virtual_cursor_last_unsticky: Option<(f32, f32, Instant)>,
+     virtual_accelerometer_last: Option<(f32, f32, bool)>,
++    pinch: Option<PinchState>,
+     /// Whether or not we are on the "main" environment stack (rather than
+     /// a coroutine stack). Checked in various functions to make sure that
+     /// certain SDL functions (that call JNI functions) are on the main
+@@ -397,6 +412,7 @@ impl Window {
+             virtual_cursor_last: None,
+             virtual_cursor_last_unsticky: None,
+             virtual_accelerometer_last: None,
++            pinch: None,
+             on_main_stack: true,
+         };
+ 
+@@ -434,6 +450,29 @@ impl Window {
+         }
+         self.last_polled = now;
+ 
++        // Advance an in-progress wheel-driven pinch gesture one step at a
++        // time, so apps that require a held two-finger gesture can see it.
++        if let Some(pinch) = self.pinch.take() {
++            if pinch.last_update.elapsed() >= Duration::from_millis(80) {
++                let mut pinch = pinch;
++                pinch.dist += pinch.step;
++                pinch.last_update = Instant::now();
++                let map = HashMap::from([
++                    (pinch.id1, (pinch.cx, pinch.cy - pinch.dist)),
++                    (pinch.id2, (pinch.cx, pinch.cy + pinch.dist)),
++                ]);
++                if pinch.steps_left > 1 {
++                    pinch.steps_left -= 1;
++                    self.event_queue.push_back(Event::TouchesMove(map));
++                    self.pinch = Some(pinch);
++                } else {
++                    self.event_queue.push_back(Event::TouchesUp(map));
++                }
++            } else {
++                self.pinch = Some(pinch);
++            }
++        }
++
+         fn transform_input_coords(
+             window: &Window,
+             (in_x, in_y): (f32, f32),
+@@ -542,6 +581,47 @@ impl Window {
+                 _ => {}
+             }
+ 
++            // Mouse wheel emulates a two-finger pinch gesture, for games
++            // (like C&C Red Alert) that use pinch-to-zoom.
++            if let E::MouseWheel { y, .. } = &event {
++                if *y != 0 {
++                    let (win_w, win_h) = self.window.size();
++                    let (mx, my) = (win_w as f32 / 2.0, win_h as f32 / 2.0);
++                    let (cx, cy) = transform_input_coords(self, (mx, my), false);
++                    let (dist, step) = if *y > 0 {
++                        (30.0f32, 8.0f32)
++                    } else {
++                        (140.0f32, -8.0f32)
++                    };
++                    let id1 = FingerId::Touch(9001);
++                    let id2 = FingerId::Touch(9002);
++                    log_dbg!("MouseWheel y={} -> pinch at ({}, {})", y, cx, cy);
++                    // Send the two fingers down separately, like a real user
++                    // placing them one after the other. Some apps only start
++                    // tracking a second touch when it arrives in its own
++                    // touchesBegan event.
++                    self.event_queue.push_back(Event::TouchesDown(HashMap::from([(
++                        id1,
++                        (cx, cy - dist),
++                    )])));
++                    self.event_queue.push_back(Event::TouchesDown(HashMap::from([(
++                        id2,
++                        (cx, cy + dist),
++                    )])));
++                    self.pinch = Some(PinchState {
++                        id1,
++                        id2,
++                        cx,
++                        cy,
++                        dist,
++                        step,
++                        steps_left: 15,
++                        last_update: Instant::now(),
++                    });
++                    continue;
++                }
++            }
++
+             self.event_queue.push_back(match event {
+                 E::Quit { .. } => Event::Quit,
+                 E::MouseButtonDown {
+@@ -1544,3 +1624,7 @@ pub fn get_preferred_country_codes(env: &mut Environment) -> Vec<String> {
+             .collect()
+     })
+ }
++
++
++
++
